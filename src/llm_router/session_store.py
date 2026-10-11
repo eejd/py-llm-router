@@ -25,6 +25,7 @@ storage problem here can never block routing, hooks, or Claude Code itself.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -185,8 +186,11 @@ def _state_dir() -> Path:
     return llm_router_home()
 
 
-def _project_id(project_root: str | None = None) -> str:
+def _project_id(project_root: str | None = None, session_id: str | None = None) -> str:
     """Stable identifier for the current project scope.
+
+    CTX-PROJ-1: with a *session_id* (and no explicit root/override) the project is
+    the session's, not the writing process's: see ``_session_project_root``.
 
     Precedence: ``$LLM_ROUTER_PROJECT_ID`` (explicit override) → a short hash of
     the current working directory. Cross-project isolation depends on this:
@@ -200,6 +204,13 @@ def _project_id(project_root: str | None = None) -> str:
             return re.sub(r"[^A-Za-z0-9._-]", "_", explicit)[:64] or "default"
     except Exception:
         pass
+    if session_id:
+        # CTX-PROJ-1: the session's pin outranks a caller-derived root. MCP/gateway callers pass the
+        # session's LATEST cwd (mcp_roots._root_from_session_pointer); honouring it would put readers
+        # at hash(worktree) while the writers stay at the pinned hash(repo).
+        pinned = _session_project_root(session_id)
+        if pinned:
+            project_root = pinned
     if project_root:
         # An explicit root from the CALLER. The MCP server's cwd is $HOME, a
         # directory no session ever writes to, so deriving the bucket from the
@@ -226,6 +237,99 @@ def _project_id(project_root: str | None = None) -> str:
     ).hexdigest()[:16]
 
 
+def _session_project_root(session_id: str) -> str | None:
+    """The repo root this session is pinned to, or None (caller falls back to its cwd).
+
+    CTX-PROJ-1 (D-57): hashing the writing process's cwd scattered one session id
+    across several ``projects/<hash>/`` shards (Bash-spawned test processes that
+    inherit the session id, a ``cd`` into a worktree). The hooks record the
+    session's cwd in ``session_cwd_<sid>.json``; the first time that record exists
+    its repo root is pinned in ``session_project_<sid>.json`` (O_EXCL, first wins),
+    so later ``cd``s and the record's rewrites cannot move the session. The pin is
+    deliberately not age-limited (``read_session_cwd`` is, by 12 h): a session
+    resumed a day later must find its own file. First-write race: before the hook
+    has written a record nothing is pinned and the writer's cwd is used (the old
+    behaviour); events written in that window stay in that shard.
+    """
+    try:
+        pin = _state_dir() / f"session_project_{_sanitize(session_id)}.json"
+        try:
+            root = json.loads(pin.read_text(encoding="utf-8")).get("project_root")
+            if isinstance(root, str) and root:
+                return root
+        except Exception:  # noqa: BLE001 — no usable pin yet
+            pass
+        rec = json.loads(_session_cwd_path(session_id).read_text(encoding="utf-8"))
+        cwd = str(rec.get("cwd") or "")
+        if not cwd:
+            return None
+        root = _repo_root_of(cwd)
+        try:
+            pin.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic publish: write a private temp file, then os.link it to the pin path. link()
+            # fails with FileExistsError if a winner exists, and a reader never sees a partial file.
+            fd, tmp = tempfile.mkstemp(dir=str(pin.parent), prefix=".pin_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"project_root": root, "ts": time.time()}, fh)
+                os.chmod(tmp, 0o600)
+                os.link(tmp, pin)
+                created = True
+            except FileExistsError:
+                created = False
+            finally:
+                with contextlib.suppress(OSError):  # our own temp file; the link (if any) is the pin
+                    os.unlink(tmp)
+            if not created:
+                # Lost a race: the winner's pin is the truth (one retry covers a slow filesystem).
+                for _ in range(2):
+                    try:
+                        won = json.loads(pin.read_text(encoding="utf-8")).get("project_root")
+                        if isinstance(won, str) and won:
+                            return won
+                    except Exception:  # noqa: BLE001
+                        time.sleep(0.02)
+            else:
+                _adopt_foreign_shards(session_id, root)
+        except OSError:
+            pass
+        return root
+    except Exception:  # noqa: BLE001 — absent/unreadable record: old behaviour
+        return None
+
+
+def _adopt_foreign_shards(session_id: str, root: str) -> None:
+    """Pin just created for *session_id*: fold its pre-pin shards into the pinned project.
+
+    A session already running at deploy wrote under hash(cwd-at-the-time); without this its older
+    events (live and archived) would sit in other project dirs and never be archived or restored
+    with the session. Reuses ``merge_session_shards`` (order by ts, de-duplicated, sources kept as
+    ``*.premerge``) under the target's lock. Best-effort: a failure leaves the shards in place for
+    ``llm-router sessions merge``.
+    """
+    try:
+        pdir = _state_dir() / "projects" / hashlib.sha1(
+            root.encode("utf-8", errors="ignore"), usedforsecurity=False
+        ).hexdigest()[:16]
+        name = f"session_context_{_sanitize(session_id)}.jsonl"
+        projects = _state_dir() / "projects"
+        live = sorted(p for p in projects.glob(f"*/{name}") if p.is_file())
+        arch = sorted(p for p in projects.glob(f"*/archive/{name}") if p.is_file())
+        target, atarget = pdir / name, pdir / "archive" / name
+        if not any(p != target for p in live) and not any(p != atarget for p in arch):
+            return
+        with exclusive_lock(_lock_path(target)) as locked:
+            if not locked:
+                _note_lock_timeout("session adopt")
+                return
+            if any(p != target for p in live):
+                merge_session_shards(session_id, apply=True, paths=live, target=target)
+            if any(p != atarget for p in arch):
+                merge_session_shards(session_id, apply=True, paths=arch, target=atarget)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _repo_root_of(start: str) -> str:
     """Nearest ancestor of *start* containing ``.git``, else *start* unchanged.
 
@@ -246,9 +350,9 @@ def _repo_root_of(start: str) -> str:
     return str(here)
 
 
-def _project_dir(project_root: str | None = None) -> Path:
+def _project_dir(project_root: str | None = None, session_id: str | None = None) -> Path:
     """Project-scoped state dir: ``~/.llm-router/projects/<project_id>``."""
-    return _state_dir() / "projects" / _project_id(project_root)
+    return _state_dir() / "projects" / _project_id(project_root, session_id)
 
 
 def _sanitize(session_id: str) -> str:
@@ -269,7 +373,7 @@ def _session_path(session_id: str, project_root: str | None = None) -> Path:
     genuinely different project stay with that project. See ``_repo_root_of`` for
     the part that IS fixed — subdirectories of one repo no longer split.
     """
-    return _project_dir(project_root) / f"session_context_{_sanitize(session_id)}.jsonl"
+    return _project_dir(project_root, session_id) / f"session_context_{_sanitize(session_id)}.jsonl"
 
 
 def _lock_path(path: Path) -> Path:
@@ -586,7 +690,6 @@ def record_event(
 
         content_hash = _content_hash(text)
         path = _session_path(session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
 
         # CHZ-AUD-C-01: the append (dedupe-check + write) and any triggered
         # compaction must run as one atomic unit across processes. Without
@@ -604,48 +707,56 @@ def record_event(
         # wrong one here. Running this block unlocked is precisely the race the
         # comment above describes, so an unlocked run does not silently do the
         # dangerous thing: it declines, counts, and says so.
-        with exclusive_lock(_lock_path(path)) as locked:
-            if not locked:
-                _note_lock_timeout("session append")
-                return
-            prev = _last_record(path)
-            if prev and prev.get("h") == content_hash:
-                return  # consecutive-duplicate dedupe
+        for attempt in (0, 1):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with exclusive_lock(_lock_path(path)) as locked:
+                if not locked:
+                    _note_lock_timeout("session append")
+                    return
+                # A pin created/merge applied while we waited can move the session's path: a stale
+                # `open("a")` would recreate the OLD shard. Re-resolve under the lock, retry once.
+                if attempt == 0 and _session_path(session_id) != path:
+                    path = _session_path(session_id)
+                    continue
+                prev = _last_record(path)
+                if prev and prev.get("h") == content_hash:
+                    return  # consecutive-duplicate dedupe
 
-            record = {
-                "ts": time.time(),
-                "kind": kind,
-                "role": role,
-                "task_type": task_type or "",
-                "tool": tool,
-                "model": model,
-                "content": text,
-                "h": content_hash,
-            }
-            # S-09: create at 0600, not 0644-then-chmod. `open` creates with
-            # `0666 & ~umask`, so on FIRST creation this file — which holds
-            # scrubbed prompt transcripts — is world-readable for the whole
-            # write, and anything that opens it inside that window keeps a
-            # readable handle after the chmod. The chmod below stays: an opener
-            # only sets the mode when it CREATES, so it is not a repair for a
-            # file an older version already wrote at 0644.
-            # NB: the BUILTIN open, not Path.open — Path.open takes no opener.
-            from llm_router.paths import private_opener
-            with open(path, "a", encoding="utf-8", opener=private_opener) as fh:
-                # NB: `text` is secret-scrubbed by _scrub_secrets() above
-                # (~L309) and the file is chmod 0600 / local-only. Storing
-                # scrubbed session context in clear text is the
-                # accumulator's purpose (routed models read it back). The
-                # CodeQL py/clear-text-storage-sensitive-data alert here is
-                # a reviewed false positive (dismissed) — the regex
-                # scrubber just isn't modelled as a sanitizer by CodeQL.
-                fh.write(json.dumps(record) + "\n")
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
+                record = {
+                    "ts": time.time(),
+                    "kind": kind,
+                    "role": role,
+                    "task_type": task_type or "",
+                    "tool": tool,
+                    "model": model,
+                    "content": text,
+                    "h": content_hash,
+                }
+                # S-09: create at 0600, not 0644-then-chmod. `open` creates with
+                # `0666 & ~umask`, so on FIRST creation this file — which holds
+                # scrubbed prompt transcripts — is world-readable for the whole
+                # write, and anything that opens it inside that window keeps a
+                # readable handle after the chmod. The chmod below stays: an opener
+                # only sets the mode when it CREATES, so it is not a repair for a
+                # file an older version already wrote at 0644.
+                # NB: the BUILTIN open, not Path.open — Path.open takes no opener.
+                from llm_router.paths import private_opener
+                with open(path, "a", encoding="utf-8", opener=private_opener) as fh:
+                    # NB: `text` is secret-scrubbed by _scrub_secrets() above
+                    # (~L309) and the file is chmod 0600 / local-only. Storing
+                    # scrubbed session context in clear text is the
+                    # accumulator's purpose (routed models read it back). The
+                    # CodeQL py/clear-text-storage-sensitive-data alert here is
+                    # a reviewed false positive (dismissed) — the regex
+                    # scrubber just isn't modelled as a sanitizer by CodeQL.
+                    fh.write(json.dumps(record) + "\n")
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
 
-            _maybe_compact(path)
+                _maybe_compact(path)
+            return
     except Exception:
         pass
 
@@ -902,14 +1013,38 @@ def cleanup_old_sessions(max_age_days: int = _TTL_DAYS) -> None:
         stale = list(state_dir.glob("session_context_*.jsonl")) + list(
             state_dir.glob("projects/*/session_context_*.jsonl")
         ) + list(state_dir.glob("projects/*/archive/session_context_*.jsonl"))
+        # B-02: merge leftovers hold the same plaintext and age out on the same TTL.
+        for pat in ("projects/*/session_context_*.jsonl.premerge",
+                    "projects/*/archive/session_context_*.jsonl.premerge",
+                    "projects/*/session_context_*.jsonl.merging",
+                    "projects/*/archive/session_context_*.jsonl.merging"):
+            stale += list(state_dir.glob(pat))
         for p in stale:
             try:
                 if p.stat().st_mtime < cutoff:
                     p.unlink()
             except OSError:
                 pass
+        _sweep_orphan_pins(state_dir, cutoff)
     except Exception:
         pass
+
+
+def _sweep_orphan_pins(state_dir: Path, cutoff: float) -> None:
+    """Delete ``session_project_<sid>.json`` and ``session_cwd_<sid>.json`` older than *cutoff*
+    whose session has no ``session_context_<sid>.jsonl`` anywhere (live or archive, any project)."""
+    have: set[str] = set()
+    for pat in ("session_context_*.jsonl", "projects/*/session_context_*.jsonl",
+                "projects/*/archive/session_context_*.jsonl"):
+        for p in state_dir.glob(pat):
+            have.add(p.name[len("session_context_"):-len(".jsonl")])
+    for prefix in ("session_project_", "session_cwd_"):
+        for p in state_dir.glob(f"{prefix}*.json"):
+            try:
+                if p.name[len(prefix):-len(".json")] not in have and p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError as exc:
+                logging.getLogger(__name__).debug("pin sweep skipped %s: %s", p, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +1118,13 @@ def fragmented_sessions() -> dict[str, dict[str, Any]]:
     return found
 
 
-def merge_session_shards(session_id: str, apply: bool = False) -> dict[str, Any]:
+def merge_session_shards(
+    session_id: str,
+    apply: bool = False,
+    *,
+    paths: list[Path] | None = None,
+    target: Path | None = None,
+) -> dict[str, Any]:
     """Consolidate every shard of *session_id* into the current project's log.
 
     Ordering is by recorded timestamp where events carry one, because a merged
@@ -993,7 +1134,9 @@ def merge_session_shards(session_id: str, apply: bool = False) -> dict[str, Any]
     Returns a report dict. With ``apply=False`` (the default) nothing is written —
     a merge that turns out to be wrong should be discovered before it is applied.
     """
-    paths = _shard_paths(session_id)
+    adopt = target is not None  # internal: fold foreign shards into an explicit target
+    if paths is None:
+        paths = _shard_paths(session_id)
     report: dict[str, Any] = {
         "session_id": session_id,
         "shards": len(paths),
@@ -1005,18 +1148,6 @@ def merge_session_shards(session_id: str, apply: bool = False) -> dict[str, Any]
     if not paths:
         return report
 
-    seen: set[tuple[str, str, Any]] = set()
-    merged: list[dict[str, Any]] = []
-    for p in paths:
-        for rec in _read_shard(p):
-            # Shards overlap when the same turn was recorded from two cwds.
-            key = (rec.get("role", ""), (rec.get("content") or "").strip(), rec.get("ts"))
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(rec)
-    report["events"] = len(merged)
-
     def _ts(rec: dict[str, Any]) -> float:
         raw = rec.get("ts", rec.get("timestamp", 0))
         try:
@@ -1024,31 +1155,86 @@ def merge_session_shards(session_id: str, apply: bool = False) -> dict[str, Any]
         except (TypeError, ValueError):
             return 0.0
 
-    merged.sort(key=_ts)
-    target = _session_path(session_id)
+    def _collect(ps: list[Path]) -> list[str]:
+        """Merged raw lines: de-duplicated, ts-ordered. Lines are kept byte-for-byte (so restore's
+        byte-identical dedupe still matches); an unparseable line stays raw, in place (after the
+        record that precedes it in its own shard), as ``_maybe_compact`` does."""
+        seen: set[tuple[str, str, Any]] = set()
+        items: list[tuple[float, int, str]] = []
+        for p in ps:
+            last_ts = 0.0
+            try:
+                raw_lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in raw_lines:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    rec = None
+                if isinstance(rec, dict):
+                    # Shards overlap when the same turn was recorded from two cwds.
+                    key = (rec.get("role", ""), (rec.get("content") or "").strip(), rec.get("ts"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    last_ts = _ts(rec)
+                items.append((last_ts, len(items), line))
+        items.sort(key=lambda t: (t[0], t[1]))
+        return [t[2] for t in items]
+
+    if target is None:
+        target = _session_path(session_id)
     report["target"] = str(target)
+    merged = _collect(paths)
+    report["events"] = len(merged)
     report["merged"] = max(0, len(merged) - max(
         (len(_read_shard(p)) for p in paths), default=0
     ))
-    if len(paths) < 2 or not apply:
+    if (len(paths) < 2 and not (adopt and paths and paths[0] != target)) or not apply:
         return report
 
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".jsonl.merging")
-        with tmp.open("w", encoding="utf-8") as fh:
-            for rec in merged:
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        # Originating shards are NOT removed. See the note above: a bad merge
-        # should cost disk, not the only copy of a conversation.
-        for p in paths:
-            if p != target:
-                try:
-                    p.rename(p.with_suffix(".jsonl.premerge"))
-                except OSError:
-                    pass
-        os.replace(str(tmp), str(target))
-        report["applied"] = True
+        import contextlib as _cl
+        with _cl.ExitStack() as stack:
+            # Writers append under the SOURCE's own lock. Hold it across read+rename, or an append
+            # landing in between is never merged. Sorted order; a source we cannot lock quickly is
+            # skipped (left in place) so adoption never blocks a hook.
+            usable: list[Path] = []
+            for p in sorted(paths):
+                if p == target:
+                    usable.append(p)
+                    continue
+                live = p.parent.parent / p.name if p.parent.name == "archive" else p
+                if stack.enter_context(exclusive_lock(_lock_path(live), timeout=0.5)):
+                    usable.append(p)
+                else:
+                    _note_lock_timeout("session merge source")
+            if not any(p != target for p in usable):
+                return report
+            merged = _collect(usable)
+            report["events"] = len(merged)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_suffix(".jsonl.merging")
+            with tmp.open("w", encoding="utf-8") as fh:
+                for line in merged:
+                    fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            # Target first, sources second: a crash between the two leaves duplicates (which the
+            # next merge de-duplicates) rather than data only in *.premerge / *.merging.
+            os.replace(str(tmp), str(target))
+            # Originating shards are NOT removed (a bad merge costs disk, not the only copy);
+            # cleanup_old_sessions ages the *.premerge files out on the retention TTL.
+            for p in usable:
+                if p != target:
+                    try:
+                        p.rename(p.with_suffix(".jsonl.premerge"))
+                    except OSError:
+                        pass
+            report["applied"] = True
     except OSError:
         pass
     return report
@@ -1056,7 +1242,7 @@ def merge_session_shards(session_id: str, apply: bool = False) -> dict[str, Any]
 
 def _archive_path(session_id: str, project_root: str | None = None) -> Path:
     """Where SessionEnd parks *session_id*'s log until the session resumes or ages out."""
-    return _project_dir(project_root) / "archive" / f"session_context_{_sanitize(session_id)}.jsonl"
+    return _project_dir(project_root, session_id) / "archive" / f"session_context_{_sanitize(session_id)}.jsonl"
 
 
 def archive_session(session_id: str | None) -> None:
