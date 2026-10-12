@@ -18,7 +18,6 @@ import json
 import os
 import tempfile
 import time
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +54,7 @@ HttpPost = Callable[[str, dict], Any]
 
 def _http_get(url: str) -> Any:
     try:
+        import urllib.request   # lazy: the hook imports this module and must not load http.client
         with urllib.request.urlopen(url, timeout=2.0) as r:
             return json.loads(r.read())
     except Exception:
@@ -63,6 +63,7 @@ def _http_get(url: str) -> Any:
 
 def _http_post(url: str, body: dict) -> Any:
     try:
+        import urllib.request
         req = urllib.request.Request(
             url, data=json.dumps(body).encode(), method="POST",
             headers={"Content-Type": "application/json"},
@@ -357,6 +358,7 @@ def _ollama_rows(inp: MapInputs, now: float) -> list[dict]:
             status="connected", reason=reason,
             marginal_cost={"value": 0.0, "label": "local; electricity not counted"},
             capabilities=caps,
+            digest=m.get("digest"),
             limits={
                 "num_ctx": local_models.num_ctx(name),
                 "max_context": _ctx_from_info(show.get("model_info")),
@@ -488,9 +490,33 @@ def refresh_if_stale(inputs: MapInputs | None = None, *, path: Path | None = Non
         age = age_seconds(cur, now)
         if age is not None and 0 <= age <= max_age_s:
             return cur
-    data = build(inputs)
-    write_map(data, path)
-    return data
+    from llm_router import map_rediscovery as _mr
+    from llm_router.file_lock import exclusive_lock
+    sdir = _mr._home()
+    # Same non-blocking lock as map_rediscovery.poll: the holder is already
+    # rebuilding and logging this diff, so we neither rebuild nor log it again.
+    st: dict = {}
+    with exclusive_lock(sdir / _mr.LOCK_FILE, timeout=0, status=st) as got:
+        if not got and st.get("state") == "held":
+            return cur if cur is not None else build(inputs)
+        if not got:
+            # Locking unavailable (e.g. unwritable LLM_ROUTER_HOME): rebuild
+            # unlocked, as before the lock existed, and record why.
+            _mr._lost("CHZ-FO-MAP-LOCK-UNAVAILABLE", OSError("map refresh lock unavailable"))
+        cur = load_map(path)          # the previous holder may have just refreshed
+        if cur is not None:
+            age = age_seconds(cur, now)
+            if age is not None and 0 <= age <= max_age_s:
+                return cur
+        data = build(inputs)
+        try:
+            _mr.record_changes(cur, data, source="refresh_if_stale",
+                               now=time.time() if now is None else now,
+                               path=(path.parent if path is not None else sdir) / _mr.CHANGES_FILE)
+        except Exception as exc:  # noqa: BLE001 - the change log never blocks a refresh
+            _mr._lost("CHZ-FO-MAP-CHANGES-WRITE", exc)
+        write_map(data, path)
+        return data
 
 
 def strip_timestamps(obj: Any) -> Any:
