@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# llm_router-hook-version: 54
+# llm_router-hook-version: 55
 """UserPromptSubmit hook — scoring classifier with Ollama + API fallback chain.
 
 Classification chain (stops at first success):
@@ -226,7 +226,7 @@ def route_call(logical: str, *args: str) -> str:
 # Cursor/Windsurf/Codex never start the MCP server so check_and_update_hooks()
 # never fires. This check emits a stderr warning when the installed hook is
 # older than the bundled one. The user sees it in their IDE's output panel.
-_THIS_VERSION_LINE = "# llm_router-hook-version: 54"
+_THIS_VERSION_LINE = "# llm_router-hook-version: 55"
 try:
     _PKG_HOOK = Path(__file__).resolve()
     _INSTALLED_HOOK = Path.home() / ".claude" / "hooks" / "llm_router-auto-route.py"
@@ -794,6 +794,13 @@ def _spawn_background_usage_refresh() -> None:
     stdout/stderr so a slow or failing child can never bleed into THIS
     hook's own stdout, which the host parses as the routing decision.
     """
+    # The detached child writes usage.json/errors into LLM_ROUTER_HOME after
+    # the caller exits. LLM_ROUTER_NO_DETACHED_SPAWN (set by the hook tests)
+    # disables it, and the model-discovery probe child too, so a temporary
+    # HOME is not written after cleanup.
+    no_bg_refresh = os.environ.get("LLM_ROUTER_NO_DETACHED_SPAWN", "")
+    if no_bg_refresh and no_bg_refresh.lower() not in ("0", "off", "false", "no"):
+        return
     script = _usage_refresh_script_path()
     if script is None:
         return
