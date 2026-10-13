@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# llm_router-hook-version: 55
+# llm_router-hook-version: 56
 """UserPromptSubmit hook — scoring classifier with Ollama + API fallback chain.
 
 Classification chain (stops at first success):
@@ -226,7 +226,7 @@ def route_call(logical: str, *args: str) -> str:
 # Cursor/Windsurf/Codex never start the MCP server so check_and_update_hooks()
 # never fires. This check emits a stderr warning when the installed hook is
 # older than the bundled one. The user sees it in their IDE's output panel.
-_THIS_VERSION_LINE = "# llm_router-hook-version: 55"
+_THIS_VERSION_LINE = "# llm_router-hook-version: 56"
 try:
     _PKG_HOOK = Path(__file__).resolve()
     _INSTALLED_HOOK = Path.home() / ".claude" / "hooks" / "llm_router-auto-route.py"
@@ -5446,9 +5446,11 @@ def main() -> None:
                 pass
 
             # Session Context Accumulator: build durable context for the draft
-            # model. target_provider="local" — the draft chain here is always
-            # free-tier (Ollama/Codex/free Gemini CLI), never a paid API, per
-            # the free-tier-drafts filter above. Fail-open to no context.
+            # model. The draft chain is free-tier (Ollama/Codex/Gemini CLI) but
+            # only Ollama is on-device (D-91, D-95): target_provider is the first
+            # chain provider outside session_store.LOCAL_PROVIDERS, else "local",
+            # so under privacy mode "local" a codex/gemini_cli chain gets no
+            # session content. Fail-open to no context.
             _session_ctx: str | None = None
             if session_id:
                 try:
@@ -5458,7 +5460,10 @@ def main() -> None:
                         max_tokens=_draft_context_budget(),
                         task_type=task_type,
                         query=prompt,
-                        target_provider="local",
+                        target_provider=next(
+                            (m.provider for m in _direct_chain
+                             if m.provider not in _session_store.LOCAL_PROVIDERS),
+                            "local"),
                     )
                 except Exception:
                     _session_ctx = None
