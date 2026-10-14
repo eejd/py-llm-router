@@ -4886,11 +4886,17 @@ async def route_and_call(
                     f"from LLM_ROUTER_BLOCK_PROVIDERS, or ensure a non-blocked provider "
                     f"(e.g. ollama/*) has a reachable model."
                 )
+            from llm_router.runtime_offer import runtime_offer
+
+            # The install offer only when no Ollama is configured; with one, the
+            # fix is doctor (its models were all filtered out or unreachable).
+            _offer = "" if "ollama" in available else (
+                "\n" + runtime_offer(api_keys=False) + "\nOr:"
+            )
             raise ValueError(
                 f"No providers available for {task_type.value}/{profile.value}. "
                 f"Configured providers: {available or 'none'}. "
-                "Fix: run `llm-router doctor` to diagnose, then one of:\n"
-                "  • Install Ollama (free, local): https://ollama.com\n"
+                f"Fix: run `llm-router doctor` to diagnose.{_offer}\n"
                 "  • Set GEMINI_API_KEY or OPENAI_API_KEY in ~/.llm-router/.env\n"
                 "  • Set LLM_ROUTER_CLAUDE_SUBSCRIPTION=true if you have Claude Pro/Max"
             )
@@ -5924,10 +5930,12 @@ async def route_and_stream(
 
     if not models_to_try:
         error_detail = f"No models available for {task_type.value} / {profile.value}"
+        from llm_router.runtime_offer import runtime_offer
+
         raise ValueError(
             f"{error_detail}. "
-            "Fix: run `llm-router doctor` to diagnose, then install Ollama (free) "
-            "or set GEMINI_API_KEY / OPENAI_API_KEY in ~/.llm-router/.env"
+            "Fix: run `llm-router doctor` to diagnose, then:\n"
+            f"{runtime_offer()}"
         )
 
     # ── Emit route.started event ──────────────────────────────────────────
