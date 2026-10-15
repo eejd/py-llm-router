@@ -12,7 +12,64 @@ produced them are in `scripts/g1_synthetic_evidence.py`.
 - **D-100:** "P1.6-g is approved to pass." P1.6-g is PASS by owner decision. It stays FAIL as a
   measurement under D-72, and the classifier stays in shadow.
 
-## Verdict
+## Update 2026-10-15: repair 1 for P1.1-b (D-101, D-102)
+
+Owner decisions in session, 2026-10-15:
+
+| Decision | Text |
+|---|---|
+| D-101 | Repair 1 = real per-model windows: a cloud door builds the pack for the model's registry window, capped at 65,536 tokens. Before, the MCP door used 8,192 for every cloud model; the gateway and the SDK used 32,768. |
+| D-102 | Re-score the Sonnet stratum with a $0 equivalence proof, with no model calls. |
+| D-103 | The four P2 PRs merged earlier under "G1 met" (#467, #484, #483, #485) stay merged as an owner exception. They are not deployed. |
+| D-104 | No deploy yet. |
+| D-105 | The owner allows ollama.com and huggingface.co in the container's network policy, for the local stratum and P1.7-d. |
+
+How repair 1 was chosen:
+
+1. **A local-model summary, ruled out.** A $0 check with no model showed that a local-model summary
+   alone could not pass. The summary worker shows the model only the first 600 characters of each
+   tool result (`context_summary._TOOL_RESULT_CAP`), so 0/10 early_tool tokens ever reach it. That
+   leaves at least 10/60 worse, or 0.167.
+2. **Real windows, chosen.** The owner chose real windows instead.
+
+**R1, uninformative and superseded.** The first proof, `PREREG-P11B-synthetic-R1` and
+`p11b-synthetic-sonnet-r1.json`, gave 120/120 at the gateway and SDK doors for
+`anthropic/claude-sonnet-5-5`. The PR #514 review showed it proves nothing about the repair:
+
+- Before D-101 both of those doors already used 32,768 for a cloud model, so the 16k-token items
+  were already sent whole. R1 passes without the repair.
+- The original FAIL setup (8,192) matches only the **MCP** door, which R1 left out.
+- The router routes Sonnet as `anthropic/claude-sonnet-4-6`. That id is not in the registry, so it
+  kept 8,192 under the first D-101 code. The registry lookup now falls back to the model's family,
+  taking the smallest family window (the `model_aliases` rule).
+
+The earlier wording here ("a test shows the same items fail at the old 8,192 window") was wrong for
+those two doors.
+
+**R2, the proof that counts.** `PREREG-P11B-synthetic-R2` was frozen at 2026-10-15T07:55:41Z,
+before its code was written and before it ran. It covers the MCP door, the routed Sonnet
+(`anthropic/claude-sonnet-4-6`) and the session transcript. It compares the D-101 window (65,536)
+with the pre-D-101 window (8,192). The result is in `p11b-synthetic-sonnet-r2.json`
+(run at 7068df1a, clean, $0; first run at a1a0b74d gave the same): **60/60 equivalent at 65,536 and 0/60 at 8,192**, so **PASS by construction, repair-attributable**.
+
+The original Sonnet FAIL below stays as the record of the pre-repair behaviour. It still describes
+sessions over ~52k tokens, where the pack falls back to the last 7 messages plus the extractive
+summary.
+
+R2's other limits:
+
+- The claude-CLI dispatch path keeps 32,768, because it receives a bare provider name.
+- The family rule applies only when every family member is at least 65,536. An unlisted legacy model
+  in such a family (`openai/gpt-4`) is over-estimated; its provider rejects an oversized prompt and
+  the router fails over.
+- A wheel install ships no `config/models.yaml`, so most current models keep the old windows there.
+- An SDK chain that starts with a cloud model sizes the pack for that model; a local fallback in the
+  same chain trims it.
+
+**G1 is still NOT passed.** The P1.1-b local stratum (PACK vs HOOK6) and P1.7-d still need a local
+model (D-105).
+
+## Verdict (2026-10-14)
 
 **G1 is NOT passed.** Clause (3), context fidelity (P1.1-b), FAILs on the Sonnet stratum, and the
 local stratum and P1.7-d cannot run in this container. P2 merges stay blocked (D-76).
